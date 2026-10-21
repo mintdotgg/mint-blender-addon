@@ -485,6 +485,79 @@ class UiTest(unittest.TestCase):
         self.assertEqual(ui_module.RUNTIME_STATE.status, "Loaded")
         self.assertIsNone(ui_module._WORLD_SPLAT_IMPORT_JOB)
 
+    def test_preview_lines_name_asset_collection_and_location(self):
+        lines = ui_module.preview_lines(
+            "Gallery Crate",
+            {"collection": "Props"},
+            "File origin (glTF coordinates)",
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "Import: Gallery Crate",
+                "Into collection: Props",
+                "Location: File origin (glTF coordinates)",
+            ],
+        )
+
+    def test_world_splat_poll_refuses_import_when_scene_changed_since_preview(self):
+        imported = []
+
+        class Cursor:
+            location = [0.0, 0.0, 0.0]
+
+        class Scene:
+            name = "Scene"
+            cursor = Cursor()
+            collection = None
+
+        class Context:
+            scene = Scene()
+            view_layer = None
+
+        class FakeBpy:
+            context = Context()
+            data = None
+
+        fake_bpy = FakeBpy()
+        preview = ui_module.import_preview(fake_bpy)
+        Cursor.location = [3.0, 0.0, 0.0]
+
+        class DoneJob:
+            log_path = Path("/tmp/kiri.log")
+            world = {"id": "world_1", "name": "Gallery"}
+            config = MintBlenderConfig()
+
+            def __init__(self):
+                self.preview = preview
+
+            def snapshot(self):
+                return True, "Importing...", Path("/tmp/world.ply"), None
+
+            def _set_status(self, status):
+                self.status = status
+
+        original_import = ui_module.import_prepared_world_splat_with_kiri
+        original_bpy = ui_module.bpy
+        ui_module.import_prepared_world_splat_with_kiri = (
+            lambda path, world, **kwargs: imported.append(path)
+        )
+        ui_module.bpy = fake_bpy
+        try:
+            ui_module._WORLD_SPLAT_IMPORT_JOB = DoneJob()
+            self.assertIsNone(ui_module._poll_world_splat_import_job())
+        finally:
+            ui_module.import_prepared_world_splat_with_kiri = original_import
+            ui_module.bpy = original_bpy
+
+        self.assertEqual(imported, [])
+        self.assertEqual(
+            ui_module.RUNTIME_STATE.status,
+            "Scene changed since preview, preview again",
+        )
+        self.assertIsNone(ui_module._WORLD_SPLAT_IMPORT_JOB)
+
     def test_draw_packs_tab_drills_into_child_models(self):
         state = AssetBrowserState(
             status="Loaded",

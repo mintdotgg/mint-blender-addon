@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 import urllib.parse
 import urllib.request
@@ -21,7 +22,16 @@ from .auth import (
     exchange_authorization_code,
     exchange_refresh_token,
 )
-from .importer import ImportUnsupportedError, import_model_asset
+from .importer import (
+    MODEL_IMPORT_LOCATION,
+    ImportUnsupportedError,
+    SceneChangedError,
+    check_import_preview,
+    import_model_asset,
+    import_preview,
+    remove_datablocks_created_since,
+    snapshot_datablocks,
+)
 from .kiri_bridge import (
     KiriBridgeError,
     KiriBridgeUnavailableError,
@@ -58,6 +68,7 @@ _ACTIVE_SPLAT_AUTO_UPDATE_LAST_SIGNATURE: Optional[tuple[Any, ...]] = None
 _ACTIVE_SPLAT_AUTO_UPDATE_TIMER_REGISTERED = False
 _ACTIVE_SPLAT_AUTO_UPDATE_INTERVAL_SECONDS = 3.0
 KIRI_DOWNLOAD_URL = "https://github.com/Kiri-Innovation/3dgs-render-blender-addon"
+WORLD_IMPORT_LOCATION = "KIRI 3DGS importer default"
 BRAND_ICON_PATH = Path(__file__).resolve().parent / "assets" / "mint_icon_mint.png"
 BRAND_ICON_PREVIEW_KEY = "mint_brand_icon"
 BRAND_ICON_SCALE = 1.0
@@ -75,8 +86,10 @@ class WorldSplatImportJob:
         access_token: str,
         config: MintBlenderConfig,
         log_path: Path,
+        preview: Optional[dict] = None,
     ):
         self.world = dict(world)
+        self.preview = preview
         self.access_token = access_token
         self.config = config
         self.log_path = log_path
@@ -184,16 +197,37 @@ def _poll_world_splat_import_job() -> Optional[float]:
         _redraw_mint_ui()
         return None
 
+    preview = getattr(job, "preview", None)
+    if preview is not None and bpy is not None:
+        try:
+            check_import_preview(preview, bpy)
+        except SceneChangedError as changed:
+            RUNTIME_STATE.status = str(changed)
+            _clear_world_splat_import_job()
+            _redraw_mint_ui()
+            return None
+
     insight_log = create_kiri_insight_log(job.config)
     job._set_status("Importing...")
     _redraw_mint_ui()
+    before_data = snapshot_datablocks(bpy) if bpy is not None else {}
     try:
-        import_prepared_world_splat_with_kiri(
-            path,
-            job.world,
-            config=job.config,
-            insight_log=insight_log,
-        )
+        try:
+            import_prepared_world_splat_with_kiri(
+                path,
+                job.world,
+                config=job.config,
+                insight_log=insight_log,
+            )
+        except Exception:
+            if bpy is not None:
+                remove_datablocks_created_since(bpy, before_data)
+            raise
+        if bpy is not None:
+            try:
+                bpy.ops.ed.undo_push(message="Import Mint World Splat")
+            except Exception:
+                pass
     except KiriBridgeUnavailableError as import_error:
         job._set_status("Failed")
         RUNTIME_STATE.status = "%s; log: %s" % (import_error, job.log_path)
@@ -845,6 +879,23 @@ def refresh_with_stored_token(
     state.refresh(api_client)
 
 
+def preview_lines(asset_name: str, preview: dict, location: str) -> list[str]:
+    return [
+        "Import: %s" % asset_name,
+        "Into collection: %s" % (preview.get("collection") or "(none)"),
+        "Location: %s" % location,
+    ]
+
+
+def _draw_preview(layout: Any, asset_name: str, preview_json: str, location: str) -> None:
+    try:
+        preview = json.loads(preview_json) if preview_json else {}
+    except ValueError:
+        preview = {}
+    for line in preview_lines(asset_name, preview, location):
+        layout.label(text=line)
+
+
 if bpy is not None:
 
     class MINT_OT_toggle_section(bpy.types.Operator):  # type: ignore
@@ -995,8 +1046,21 @@ if bpy is not None:
         bl_idname = "mint_asset_browser.import_model"
         bl_label = "Import Mint Model"
         bl_description = "Download and import this model GLB into Blender"
+        bl_options = {"REGISTER", "UNDO"}
 
         asset_id: bpy.props.StringProperty(default="")  # type: ignore
+        preview: bpy.props.StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})  # type: ignore
+
+        def invoke(self, context, event):  # type: ignore
+            if not RUNTIME_STATE.find_model(self.asset_id):
+                RUNTIME_STATE.status = "Model not found"
+                return {"CANCELLED"}
+            self.preview = json.dumps(import_preview(bpy))
+            return context.window_manager.invoke_props_dialog(self)
+
+        def draw(self, context):  # type: ignore
+            model = RUNTIME_STATE.find_model(self.asset_id) or {}
+            _draw_preview(self.layout, _asset_name(model), self.preview, MODEL_IMPORT_LOCATION)
 
         def execute(self, context):  # type: ignore
             config = MintBlenderConfig.from_env()
@@ -1005,7 +1069,16 @@ if bpy is not None:
                 RUNTIME_STATE.status = "Model not found"
                 return {"CANCELLED"}
             try:
-                import_model_asset(model, AssetCache(config.cache_dir), config=config)
+                import_model_asset(
+                    model,
+                    AssetCache(config.cache_dir),
+                    config=config,
+                    preview=json.loads(self.preview) if self.preview else None,
+                )
+            except SceneChangedError as error:
+                RUNTIME_STATE.status = str(error)
+                self.report({"WARNING"}, str(error))
+                return {"CANCELLED"}
             except ImportUnsupportedError as error:
                 RUNTIME_STATE.status = str(error)
                 return {"CANCELLED"}
@@ -1021,6 +1094,21 @@ if bpy is not None:
         bl_description = "View splat"
 
         asset_id: bpy.props.StringProperty(default="")  # type: ignore
+        preview: bpy.props.StringProperty(default="", options={"HIDDEN", "SKIP_SAVE"})  # type: ignore
+
+        def invoke(self, context, event):  # type: ignore
+            job = _WORLD_SPLAT_IMPORT_JOB
+            if job is not None and not job.snapshot()[0]:
+                return self.execute(context)
+            if not RUNTIME_STATE.find_world(self.asset_id):
+                RUNTIME_STATE.status = "World not found"
+                return {"CANCELLED"}
+            self.preview = json.dumps(import_preview(bpy))
+            return context.window_manager.invoke_props_dialog(self)
+
+        def draw(self, context):  # type: ignore
+            world = RUNTIME_STATE.find_world(self.asset_id) or {}
+            _draw_preview(self.layout, _asset_name(world), self.preview, WORLD_IMPORT_LOCATION)
 
         def execute(self, context):  # type: ignore
             global _WORLD_SPLAT_IMPORT_JOB
@@ -1065,6 +1153,7 @@ if bpy is not None:
                 RUNTIME_STATE.access_token,
                 config,
                 log_path,
+                preview=json.loads(self.preview) if self.preview else None,
             )
             _WORLD_SPLAT_IMPORT_JOB.start()
             _register_world_splat_import_timer()
